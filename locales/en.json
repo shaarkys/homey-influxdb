@@ -25,6 +25,8 @@
     "confirm_message": "Settings were updated!"
   },
   "messages": {
+    "influxdb_initializing": "InfluxDb is still initializing.",
+    "measurement_not_queued": "Measurement could not be queued: invalid data or buffer full.",
     "export_not_initialized_yet": "The app is not completely initialized yet, so cannot start export process."
   }
 }

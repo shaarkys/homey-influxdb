@@ -1,6 +1,5 @@
 import HomeyPkg from "homey";
 import HomeyApiPkg from "homey-api";
-import { delay } from "./lib/util.mjs";
 import * as measurementsUtil from "./lib/measurementsUtil.mjs";
 import HomeyStateHandler from "./lib/HomeyStateHandler.mjs";
 import DeviceHandler from "./lib/DeviceHandler.mjs";
@@ -14,47 +13,38 @@ const { HomeyAPI } = HomeyApiPkg;
 export default class InfluxDbApp extends App {
   async onInit() {
     this._boundOnHomeyStateChanged = this._onHomeyStateChanged.bind(this);
+    this._boundOnSettingsChanged = key => this._onSettingsChanged(key).catch(err => this.log('Settings update failed:', err));
+    this._stopped = false;
     this._running = false;
+    this._apiReady = false;
     this.homey.on("unload", () => this._onUninstall());
     // Register Flow Cards first
     await this.initFlows();
+    if (this._stopped) return;
     this.log("Flow Cards initialized.");
+
+    this._influxDb = new InfluxDb({ homey: this.homey, log: this.log });
+    this._influxDb.on("offline", this._onOffline.bind(this));
+    this._influxDb.on("online", this._onOnline.bind(this));
+    await this.initSettings();
+    if (this._stopped) return;
+    this._influxDb.scheduleWriteToInfluxDb();
 
     await this.onStartup(); // Await onStartup to ensure proper sequencing
   }
 
   async onStartup() {
+    if (this._stopped || this._starting) return;
+    this._starting = true;
+    if (this._startupTimeout) this.homey.clearTimeout(this._startupTimeout);
+    this._startupAttempts = (this._startupAttempts || 0) + 1;
     try {
       await this.getApi();
+      if (this._stopped) return;
       if (await this.shallWaitForHomey()) {
         await this.waitForHomey();
       }
-
-      // Now Initialize InfluxDB
-      this._influxDb = new InfluxDb({ homey: this.homey, log: this.log });
-      this.log("InfluxDb instance created.");
-
-      // Initialize InfluxDb asynchronously
-      await this._influxDb.initialize({
-        host: this.homey.settings.get("host"),
-        protocol: this.homey.settings.get("protocol"),
-        port: this.homey.settings.get("port"),
-        organization: this.homey.settings.get("organization"),
-        token: this.homey.settings.get("token"),
-        username: this.homey.settings.get("username"),
-        password: this.homey.settings.get("password"),
-        database: this.homey.settings.get("database"),
-      });
-      this.log("InfluxDb initialized with settings.");
-
-      // Attach event listeners after initialization
-      this._influxDb.on("offline", this._onOffline.bind(this));
-      this._influxDb.on("online", this._onOnline.bind(this));
-      this.log("InfluxDb event listeners attached.");
-
-      // Initialize Settings After InfluxDb
-      await this.initSettings();
-      this.log("Settings initialized.");
+      if (this._stopped) return;
 
       // Initialize Flow Cards After InfluxDb and Settings
       // moved to OnInit due to the error Flow Card not registered (type: condition, id: is_online)
@@ -62,13 +52,16 @@ export default class InfluxDbApp extends App {
       // this.log("Flow Cards initialized.");
 
       // Proceed with Device Handler Initialization
+      if (this._devices) this._devices.destroy();
       this._devices = new DeviceHandler({ homey: this.homey, api: this._api, log: this.log });
       this._devices.on("capability", this._onCapability.bind(this));
       await this._devices.registerDevices();
+      if (this._stopped) return;
       this.log("Devices registered.");
 
       // Enable or Disable Metrics as per Settings
       await this.enableDisableMetrics();
+      if (this._stopped) return;
       this.log("Metrics enabled/disabled as per settings.");
 
       // Schedule InfluxDB Writes
@@ -76,9 +69,19 @@ export default class InfluxDbApp extends App {
       this.log("InfluxDb write scheduling initiated.");
 
       this._running = true;
+      this._startupAttempts = 0;
       this.log("InfluxDbApp is running...");
     } catch (err) {
       this.log("onStartup error:", err);
+      if (!this._stopped && this._startupAttempts < 10) {
+        const retryDelay = Math.min(30000 * this._startupAttempts, 300000);
+        this.log(`Retrying Homey initialization in ${retryDelay / 1000} seconds`);
+        this._startupTimeout = this.homey.setTimeout(() => this.onStartup(), retryDelay);
+      } else if (!this._stopped) {
+        this.log('Homey initialization failed after 10 attempts; restart the app to retry');
+      }
+    } finally {
+      this._starting = false;
     }
   }
 
@@ -147,7 +150,7 @@ export default class InfluxDbApp extends App {
 
     // Handle write_interval
     let write_interval = this.homey.settings.get("write_interval");
-    if (!write_interval) {
+    if (!Number.isFinite(Number(write_interval)) || Number(write_interval) < 10 || Number(write_interval) > 60) {
       write_interval = 10;
       this.homey.settings.set("write_interval", write_interval);
     }
@@ -167,7 +170,7 @@ export default class InfluxDbApp extends App {
     };
 
     // Listen for settings changes
-    this.homey.settings.on("set", this._onSettingsChanged.bind(this));
+    this.homey.settings.on("set", this._boundOnSettingsChanged);
 
     // Update InfluxDb settings
     await this._influxDb.updateSettings({
@@ -182,13 +185,15 @@ export default class InfluxDbApp extends App {
     });
 
     // Update write interval
-    this._influxDb.updateWriteInterval(write_interval);
+    if (!this._stopped) this._influxDb.updateWriteInterval(write_interval);
   }
 
   async _onSettingsChanged(key) {
+    if (this._stopped) return;
     this.log("Settings changed", key);
     if (key === "settings") {
       const settings = this.homey.settings.get("settings");
+      if (!settings || typeof settings !== 'object') throw new Error('Invalid settings');
 
       // Update various settings
       this.homey.settings.set("host", settings.host);
@@ -214,7 +219,7 @@ export default class InfluxDbApp extends App {
       this._measurementOptions = {
         measurementMode: settings.measurement_mode,
         measurementPrefix: settings.measurement_prefix,
-        percentageScale: settings.percentage_scale || "default", // Provide a fallback if necessary
+        percentageScale: this.homey.settings.get("percentage_scale") || "default",
       };
     }
   }
@@ -228,14 +233,20 @@ export default class InfluxDbApp extends App {
     let numDevices = 0;
     let attempts = 0;
     const maxAttempts = 50;
-    while (attempts < maxAttempts) {
+    while (!this._stopped && attempts < maxAttempts) {
       let currentDevices = Object.keys(await this._api.devices.getDevices()).length;
+      if (this._stopped) return;
       if (currentDevices === numDevices) {
         break;
       }
       numDevices = currentDevices;
       attempts++;
-      await delay(this.homey, 120 * 1000);
+      await new Promise(resolve => {
+        this._resumeStartup = resolve;
+        this._waitTimeout = this.homey.setTimeout(resolve, 120 * 1000);
+      });
+      this._waitTimeout = undefined;
+      this._resumeStartup = undefined;
     }
     if (attempts === maxAttempts) {
       this.log("waitForHomey: Reached maximum attempts without stabilizing device count.");
@@ -267,8 +278,9 @@ export default class InfluxDbApp extends App {
       this.log('Action Card "enable_metrics" registered successfully');
 
       this.homey.flow.getActionCard("influxdb_write_interval").registerRunListener(async (args, state) => {
-        this.homey.settings.set("write_interval", args.write_interval);
+        if (!this._influxDb) throw new Error(this.homey.__('messages.influxdb_initializing'));
         this._influxDb.updateWriteInterval(args.write_interval);
+        this.homey.settings.set("write_interval", args.write_interval);
       });
       this.log('Action Card "influxdb_write_interval" registered successfully');
 
@@ -288,17 +300,23 @@ export default class InfluxDbApp extends App {
       this.log('Action Card "write_text" registered successfully');
     } catch (error) {
       this.log("Error registering Flow Cards:", error);
+      throw error;
     }
   }
 
   async getApi() {
     if (!this._api) {
       this._api = await HomeyAPI.createAppAPI({ homey: this.homey, debug: false });
-      await this._api.system.connect();
-      await this._api.devices.connect();
-      await this._api.zones.connect();
-      await this._api.insights.connect();
     }
+    if (this._stopped) {
+      this._api.destroy();
+      return this._api;
+    }
+    for (const manager of [this._api.system, this._api.devices, this._api.zones, this._api.insights]) {
+      if (this._stopped) return this._api;
+      await manager.connect();
+    }
+    this._apiReady = !this._stopped;
     return this._api;
   }
 
@@ -310,6 +328,7 @@ export default class InfluxDbApp extends App {
   }
 
   async homeyState(enabled, appMetrics) {
+    if (this._stopped) return;
     if (enabled) {
       if (!this._homey) {
         this._homey = new HomeyStateHandler({ homey: this.homey, api: this._api, log: this.log });
@@ -319,7 +338,7 @@ export default class InfluxDbApp extends App {
       this._homey.appMetrics(appMetrics);
     } else {
       if (this._homey) {
-        this._homey._clearSchedule();
+        this._homey.destroy();
         this._homey.removeListener("state.changed", this._boundOnHomeyStateChanged);
         //delete this._homey;
         this._homey = null;
@@ -328,6 +347,7 @@ export default class InfluxDbApp extends App {
   }
 
   async insights(enabled) {
+    if (this._stopped) return;
     if (enabled) {
       if (!this._insights) {
         this._insights = new InsightsHandler({ homey: this.homey, api: this._api, log: this.log });
@@ -335,7 +355,7 @@ export default class InfluxDbApp extends App {
       }
     } else {
       if (this._insights) {
-        this._insights._clearSchedule();
+        this._insights.destroy();
         //delete this._insights;
         this._insights = null;
       }
@@ -343,6 +363,7 @@ export default class InfluxDbApp extends App {
   }
 
   async enableDisableMetrics() {
+    if (!this._apiReady || this._stopped) return;
     const enabled = this.homey.settings.get("homey_metrics");
     const homeyMetrics = enabled === "true" || enabled === "homey";
     const appMetrics = enabled === "true";
@@ -355,37 +376,46 @@ export default class InfluxDbApp extends App {
 
   async writeFromValue(measurement, value) {
     if (!this._influxDb) {
-      return;
+      throw new Error(this.homey.__('messages.influxdb_initializing'));
     }
-    this._influxDb.write(measurementsUtil.fromValue(measurement, value, this._measurementOptions));
+    const point = measurementsUtil.fromValue(measurement, value, this._measurementOptions);
+    if (!point || !this._influxDb.write(point)) throw new Error(this.homey.__('messages.measurement_not_queued'));
   }
 
   async writeEvents(events) {
     if (!this._influxDb) {
       return;
     }
-    this._influxDb.writeMeasurements(measurementsUtil.fromEvents(events, this._measurementOptions));
+    await this._influxDb.writeMeasurements(measurementsUtil.fromEvents(events, this._measurementOptions));
   }
 
   _onUninstall() {
+    this._stopped = true;
+    this._running = false;
+    this._apiReady = false;
+    if (this._startupTimeout) this.homey.clearTimeout(this._startupTimeout);
+    if (this._waitTimeout) this.homey.clearTimeout(this._waitTimeout);
+    if (this._resumeStartup) this._resumeStartup();
+    this.homey.settings.off('set', this._boundOnSettingsChanged);
     try {
       if (this._insights) {
-        this._insights._clearSchedule();
+        this._insights.destroy();
         this._insights = null;
       }
       if (this._homey) {
-        this._homey._clearSchedule();
+        this._homey.destroy();
         this._homey.removeListener("state.changed", this._boundOnHomeyStateChanged);
         this._homey = null;
       }
       if (this._influxDb) {
-        this._influxDb._clearSchedule();
+        this._influxDb.destroy();
         this._influxDb = null;
       }
       if (this._devices) {
-        this._devices.unregisterDevices();
+        this._devices.destroy();
         this._devices = null;
       }
+      if (this._api) this._api.destroy();
     } catch (err) {
       this.log("_onUninstall error", err);
     }

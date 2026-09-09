@@ -1,7 +1,9 @@
-const chai = require("chai");
-const expect = chai.expect;
-
-const measurementsUtil = require('../lib/measurementsUtil');
+let expect;
+let measurementsUtil;
+before(async function () {
+  ({ expect } = await import('chai'));
+  measurementsUtil = await import('../lib/measurementsUtil.mjs');
+});
 
 describe("_isSupported", function () {
   describe("Check null", function () {
@@ -114,7 +116,7 @@ describe("_formatFieldValue", function () {
       expect(measurementsUtil._formatFieldValue("bob,", null)).to.eq("\"bob\,\"")
     });
     it("Check string \\", function () {
-      expect(measurementsUtil._formatFieldValue("bob\\", null)).to.eq("\"bob\\\"")
+      expect(measurementsUtil._formatFieldValue("bob\\", null)).to.eq('"bob\\\\"')
     });
   });
   describe("Check numbers", function () {
@@ -169,7 +171,7 @@ describe("fromCapability", function () {
       expect(ret.tags.name).to.eq('Some+\\=.\\,/\\_name_')
       expect(ret.tags.zoneId).to.eq('456-234')
       expect(ret.tags.zone).to.eq('The_Zone_\\=\\,_Name')
-      expect(ret.fields['912-232']).to.eq('\"String \\ = , \\"value\\"\"')
+      expect(ret.fields['912-232']).to.eq('"String \\\\ = , \\"value\\""')
       !expect(ret.timestamp).is.not.null
     });
   });
@@ -219,7 +221,7 @@ describe("fromValue", function () {
         measurementPrefix: 'APrefix ='
       });
       expect(ret.measurement).to.eq('APrefix_\\=X_\\=_Y_\\,_1')
-      expect(ret.fields.value).to.eq('\"Some\\"Value\\\"')
+      expect(ret.fields.value).to.eq('"Some\\"Value\\\\"')
       !expect(ret.timestamp).is.not.null
     });
   });

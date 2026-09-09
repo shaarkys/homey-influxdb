@@ -117,8 +117,10 @@
 
 <script type="text/javascript">
   function onHomeyReady(Homey) {
+    Homey.ready();
     let _view;
     let _statusTimeout;
+    let _statusPending = false;
     let hostElement = document.getElementById('host');
     let portElement = document.getElementById('port');
     let organizationElement = document.getElementById('organization');
@@ -173,9 +175,12 @@
       updateView('status');
     });
 
-    const fetchStatus = async function (cb) {
-      try {
-        Homey.api('GET', '/status', null, function (err, status) {
+    const fetchStatus = function () {
+      clearFetchTimeout();
+      if (_statusPending) return;
+      _statusPending = true;
+      Homey.api('GET', '/status', null, function (err, status) {
+          _statusPending = false;
           if (err) {
             Homey.alert(err);
           } else {
@@ -193,13 +198,8 @@
               }
             }
           }
-        });
-      } finally {
         scheduleFetchStatus();
-        if (cb) {
-          cb();
-        }
-      }
+      });
     };
 
     const clearFetchTimeout = function () {
@@ -211,7 +211,7 @@
 
     const scheduleFetchStatus = function (interval = 2) {
       clearFetchTimeout();
-      if (_view === 'init' || _view === 'status') {
+      if (!_statusPending && (_view === 'init' || _view === 'status')) {
         _statusTimeout = setTimeout(async function () {
           await fetchStatus();
         }, interval * 1000);
@@ -229,13 +229,11 @@
       databaseElement.value = await getSetting('database');
       measurementModeElement.value = await getSetting('measurement_mode');
       measurementPrefixElement.value = await getSetting('measurement_prefix');
-      await fetchStatus(() => {
-        Homey.ready();
-      });
+      fetchStatus();
 
     };
 
-    initialize();
+    initialize().catch(err => Homey.alert(err.message || String(err)));
   }
 </script>
 </body>
